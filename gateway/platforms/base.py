@@ -140,6 +140,12 @@ def _reply_anchor_for_event(event) -> str | None:
     topic lanes prefer replying to the triggering user message so the answer
     stays attached to the active lane; synthetic/resumed sends fall back to
     ``direct_messages_topic_id`` metadata when no message id is available.
+
+    Buzz: the adapter carries the stable NIP-10 thread root through the
+    normalized ``MessageEvent`` as ``_hermes_buzz_thread_root`` (computed
+    from ``root`` / ``reply`` e-tag markers).  For a flat thread we return
+    that instead of ``message_id`` (the immediate parent) so replies always
+    anchor to the same top-level event regardless of nesting depth.
     """
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
@@ -156,6 +162,12 @@ def _reply_anchor_for_event(event) -> str | None:
         # SlackAdapter._resolve_thread_ts() treat it as a thread anchor and
         # reply in a (nonexistent) thread anyway.
         return None
+    if platform == "buzz":
+        # Anchor to the stable NIP-10 thread root (set by the adapter from the
+        # inbound e-tags) so replies stay on the same top-level event instead
+        # of nesting deeper each turn. Top-level messages carry no root and
+        # fall back to the default message_id anchor.
+        return getattr(event, "_hermes_buzz_thread_root", None) or getattr(event, "message_id", None)
     if platform == "telegram" and thread_id and getattr(source, "chat_type", None) == "dm":
         # Reply to the triggering user message. Replying to Telegram's earlier
         # topic seed/anchor can render the bot response outside the active lane.

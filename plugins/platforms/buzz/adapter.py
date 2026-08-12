@@ -333,6 +333,41 @@ def _cli_error_message(stderr: str, returncode: int) -> str:
     return text or f"buzz CLI failed with exit code {returncode}"
 
 
+def _nip10_extract_root(tags) -> Optional[str]:
+    """Extract the stable thread-root event ID from NIP-10 ``e`` tags.
+
+    Parsing rules (mirrors buzz-cli ``find_root_from_tags``):
+    - If a ``root`` marker exists, return that event ID (flat-thread anchor).
+    - Otherwise, if only a ``reply`` marker exists, return it (direct child —
+      the reply target IS the root for a shallow reply chain).
+    - If no thread markers exist, return ``None`` (top-level message, default
+      reply-to is self).
+    - Malformed entries (wrong length, non-hex id, missing fields) are skipped
+      silently rather than failing — a bad tag on the parent must not block
+      sending the reply.
+    """
+
+    def _valid(eid: str) -> bool:
+        return isinstance(eid, str) and len(eid) == 64 and all(
+            c in "0123456789abcdef" for c in eid
+        )
+
+    root: Optional[str] = None
+    reply: Optional[str] = None
+    for part in tags or []:
+        if not (isinstance(part, (list, tuple)) and len(part) >= 4):
+            continue
+        if part[0] != "e":
+            continue
+        eid = part[1] if _valid(str(part[1])) else None
+        marker = str(part[3]) if len(part) > 3 else ""
+        if marker == "root" and eid:
+            root = eid
+        elif marker == "reply" and eid and root is None:
+            reply = eid
+    return root or reply
+
+
 def _parse_json_list(stdout: str) -> List[dict]:
     """Parse CLI stdout expected to be a JSON array of objects."""
     try:
@@ -1048,6 +1083,12 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
+        # Compute the stable NIP-10 thread root from inbound e-tags so that
+        # replies always anchor to the original top-level event instead of
+        # nesting deeper with each turn (#47859).
+        tags = event.get("tags") or []
+        buzz_thread_root = _nip10_extract_root(tags)
+
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
@@ -1056,6 +1097,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            buzz_thread_root=buzz_thread_root,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
@@ -1219,8 +1261,18 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        buzz_thread_root: Optional[str] = None,
     ) -> None:
-        """Build a MessageEvent and hand it to the base class handler."""
+        """Build a MessageEvent and hand it to the base class handler.
+
+        ``buzz_thread_root`` is the stable NIP-10 root event ID computed from
+        the inbound Nostr e-tags (a ``root`` marker when present, otherwise
+        a ``reply`` marker for direct children, or None for top-level).  It
+        is stored on the event so that the shared ``_reply_anchor_for_event``
+        returns it as the reply target instead of the immediate parent's ID.
+        The ``message_id`` is preserved unchanged for de-duplication, reactions,
+        and ledger purposes.
+        """
         if not self._message_handler:
             return
 
@@ -1239,6 +1291,12 @@ class BuzzAdapter(BasePlatformAdapter):
             message_id=message_id,
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
         )
+
+        # Carry the Buzz thread root through to the common reply-anchor helper.
+        # Only set the attribute when there actually IS a root; leave the
+        # default path (message_id) intact for top-level messages.
+        if buzz_thread_root is not None:
+            event._hermes_buzz_thread_root = buzz_thread_root
 
         await self.handle_message(event)
         
