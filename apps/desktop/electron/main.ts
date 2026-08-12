@@ -194,6 +194,7 @@ import {
 } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
+import { normalizePayload as normalizeTranslucencyPayload, windowOpacityFor } from './translucency'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
@@ -739,41 +740,36 @@ function writePersistedThemeSource(mode) {
 nativeTheme.themeSource = readPersistedThemeSource()
 
 // Window translucency (see-through window). One lever, 0–100; 0 = off (the
-// default). Mapped to the native window opacity so the desktop shows through
-// the whole window. Persisted so a cold launch applies it at window creation,
-// before the renderer reports its value. macOS + Windows only; `setOpacity` is
-// a no-op on Linux. See store/translucency.
+// default). Two modes share the lever (see electron/translucency.ts and
+// store/translucency): 'clear' maps it to the native window opacity so the
+// desktop shows through the whole window; 'glass' (macOS) keeps the window
+// opaque and lets the renderer thin its surfaces over the vibrancy material
+// instead — a matte blur with full-contrast text. Persisted so a cold launch
+// applies it at window creation, before the renderer reports its value.
+// macOS + Windows only; `setOpacity` is a no-op on Linux.
 const TRANSLUCENCY_CONFIG_PATH = path.join(app.getPath('userData'), 'translucency.json')
-
-function clampIntensity(value) {
-  const n = Math.round(Number(value))
-
-  return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0
-}
 
 function readPersistedTranslucency() {
   try {
-    return clampIntensity(JSON.parse(fs.readFileSync(TRANSLUCENCY_CONFIG_PATH, 'utf8')).intensity)
+    return normalizeTranslucencyPayload(JSON.parse(fs.readFileSync(TRANSLUCENCY_CONFIG_PATH, 'utf8')), IS_MAC)
   } catch {
-    return 0
+    return { intensity: 0, mode: 'clear' as const }
   }
 }
 
-function writePersistedTranslucency(intensity) {
+function writePersistedTranslucency(state) {
   try {
     fs.mkdirSync(path.dirname(TRANSLUCENCY_CONFIG_PATH), { recursive: true })
-    fs.writeFileSync(TRANSLUCENCY_CONFIG_PATH, JSON.stringify({ intensity }, null, 2), 'utf8')
+    fs.writeFileSync(TRANSLUCENCY_CONFIG_PATH, JSON.stringify(state, null, 2), 'utf8')
   } catch (error) {
     rememberLog(`[translucency] write failed: ${error.message}`)
   }
 }
 
-let translucencyIntensity = readPersistedTranslucency()
+let translucencyState = readPersistedTranslucency()
 
-// Map the 0–100 lever to a window opacity. Floor at 0.3 so the most see-through
-// setting is still usable rather than nearly invisible. 0 → fully opaque.
 function windowOpacity() {
-  return 1 - (translucencyIntensity / 100) * 0.7
+  return windowOpacityFor(translucencyState.intensity, translucencyState.mode)
 }
 
 // Re-apply translucency to a live window (runtime toggle, no recreation).
@@ -11110,13 +11106,13 @@ ipcMain.on('hermes:native-theme', (_event, mode) => {
 // See-through window translucency. Persist + re-apply opacity to every open
 // window at runtime (no recreation, so caching/sessions are untouched).
 ipcMain.on('hermes:translucency', (_event, payload) => {
-  const next = clampIntensity(payload && payload.intensity)
+  const next = normalizeTranslucencyPayload(payload, IS_MAC)
 
-  if (next === translucencyIntensity) {
+  if (next.intensity === translucencyState.intensity && next.mode === translucencyState.mode) {
     return
   }
 
-  translucencyIntensity = next
+  translucencyState = next
   writePersistedTranslucency(next)
 
   for (const win of BrowserWindow.getAllWindows()) {
