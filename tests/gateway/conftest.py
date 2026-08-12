@@ -331,6 +331,41 @@ _ensure_telegram_mock()
 _ensure_discord_mock()
 
 
+@pytest.fixture(autouse=True)
+def _restore_dynamic_default_db_path(monkeypatch):
+    """Undo the root conftest's DEFAULT_DB_PATH pin so resolution stays dynamic.
+
+    The root ``_hermetic_environment`` fixture re-pins
+    ``hermes_state.DEFAULT_DB_PATH`` to that test's ``hermes_test/state.db``.
+    ``hermes_state._default_db_path()`` treats any value differing from the
+    import-time snapshot as a deliberate re-point, so the pin wins over every
+    later runtime ``HERMES_HOME`` redirect inside the test body — but only
+    when ``hermes_state`` was already imported (by another test file at
+    collection). That made gateway tests order-dependent: standalone runs
+    (lazy import, no pin) followed runtime ``HERMES_HOME``; grouped runs
+    (collected import, pinned constant) did not.
+
+    Restoring the constant to the import-time snapshot makes
+    ``_default_db_path()`` fall through to ``get_hermes_home()`` at call
+    time, so an argless ``SessionDB()`` always follows the *current*
+    ``HERMES_HOME`` — the hermetic ``hermes_test`` home by default, or
+    whatever a test sets itself. Tests that deliberately re-point the
+    constant still win (their value differs from the snapshot). Runs after
+    the root fixture because outer-conftest autouse fixtures set up first;
+    monkeypatch teardown restores the pinned value for non-gateway tests.
+    """
+    hermes_state_mod = sys.modules.get("hermes_state")
+    if hermes_state_mod is not None and hasattr(
+        hermes_state_mod, "_IMPORT_DEFAULT_DB_PATH"
+    ):
+        monkeypatch.setattr(
+            hermes_state_mod,
+            "DEFAULT_DB_PATH",
+            hermes_state_mod._IMPORT_DEFAULT_DB_PATH,
+        )
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Plugin-adapter anti-pattern guard
 # ---------------------------------------------------------------------------
